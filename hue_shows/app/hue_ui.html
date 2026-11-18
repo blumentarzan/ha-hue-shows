@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Attic Show</title>
+<title>Hue Shows</title>
 <style>
   :root { --bg:#fff; --fg:#1b1f24; --muted:#667; --card:#f3f4f7; --accent:#6d3df0; --ok:#1a8a4a; --bad:#c0392b; }
   @media (prefers-color-scheme: dark) { :root { --bg:#14161a; --fg:#e8eaee; --muted:#9aa0ab; --card:#1f232a; --accent:#9b7bff; --ok:#4cc27a; --bad:#ff7a6b; } }
@@ -26,7 +26,12 @@
 </head>
 <body>
 <main>
-  <h1>Attic Show</h1>
+  <h1>Hue Shows</h1>
+  <div class="row" style="margin-bottom:12px">
+    <button id="t-show" class="on">Show</button>
+    <button id="t-layout">Layout</button>
+  </div>
+  <div id="tab-show">
 
   <div class="card" id="setup" hidden>
     <div class="muted" style="margin-bottom:8px">Connect your Hue Bridge</div>
@@ -71,6 +76,55 @@
     <div class="row"><span class="big" id="bpm">-</span><span class="muted">BPM</span>
       <span class="muted" style="margin-left:16px">beats <span id="beats">0</span></span></div>
     <p class="muted" id="micnote" style="margin:8px 0 0">Microphone only works on localhost or https.</p>
+  </div>
+  </div><!-- /tab-show -->
+
+  <div id="tab-layout" hidden>
+    <div class="card">
+      <div class="row">
+        <label class="muted">Room length <input id="rlen" type="number" min="1" max="60" step="0.5" style="width:80px"> m</label>
+        <label class="muted">width <input id="rwid" type="number" min="1" max="60" step="0.5" style="width:80px"> m</label>
+      </div>
+      <svg id="room" style="width:100%;max-height:60vh;margin-top:10px;touch-action:none;background:var(--bg);border-radius:8px"></svg>
+      <p class="muted" style="margin:6px 0 0">Entrance at the top, window at the bottom. Drag a light to move it; tap to select. With a preset chosen below, tapping a light adds or removes it from that preset.</p>
+    </div>
+
+    <div class="card" id="sel-card" hidden>
+      <div class="muted" id="sel-name" style="margin-bottom:8px"></div>
+      <div class="row">
+        <label class="muted">x <input id="sx" type="number" step="0.05" style="width:80px"></label>
+        <label class="muted">y <input id="sy" type="number" step="0.05" style="width:80px"></label>
+        <label class="muted">points <select id="sz"><option value="-0.5">down</option><option value="0">sideways</option><option value="0.5">up</option></select></label>
+        <label class="muted">group <input id="sg" size="6"></label>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="muted" style="margin-bottom:8px">Lights on your bridge (only entertainment-capable lights can be used)</div>
+      <input id="lfilter" placeholder="filter by name" style="width:100%;box-sizing:border-box;margin-bottom:8px">
+      <div id="llist" style="max-height:220px;overflow:auto"></div>
+      <div class="row" style="margin-top:8px">
+        <button id="a-line">Arrange in a line</button>
+        <button id="a-rails">Arrange as two rails</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="muted" style="margin-bottom:4px">Presets: the bridge streams one 10-light area at a time; the engine switches between these</div>
+      <div id="plist" style="margin:8px 0"></div>
+      <div class="row">
+        <button id="p-add">Add preset</button>
+        <button id="p-sug">Suggest presets</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <button id="l-save" class="primary">Save layout</button>
+        <button id="l-apply">Save and apply to bridge</button>
+      </div>
+      <p class="muted" id="lnote" style="margin:8px 0 0">Applying creates or replaces entertainment areas on the bridge that have the same names as your presets.</p>
+    </div>
   </div>
 </main>
 
@@ -166,6 +220,178 @@ function loop() {
   }
   requestAnimationFrame(loop);
 }
+
+// ---- layout editor ----------------------------------------------------------
+let LY = null, LIGHTS = [], selId = null, activeP = -1, loaded = false, dirty = false;
+const NS = 'http://www.w3.org/2000/svg';
+const short = n => (n || '').split(' ').pop();
+const spotById = id => LY.spots.find(s => s.id === id);
+const lnote = t => { $('lnote').textContent = t; };
+
+function showTab(name) {
+  $('tab-show').hidden = name !== 'show'; $('tab-layout').hidden = name !== 'layout';
+  $('t-show').className = name === 'show' ? 'on' : ''; $('t-layout').className = name === 'layout' ? 'on' : '';
+  if (name === 'layout' && !loaded) loadLayout();
+}
+$('t-show').onclick = () => showTab('show');
+$('t-layout').onclick = () => showTab('layout');
+
+async function loadLayout() {
+  const r = await api('/api/layout');
+  if (r.error) { lnote(r.error); return; }
+  LY = r.layout; LIGHTS = r.lights; loaded = true; dirty = false; selId = null; activeP = -1;
+  $('rlen').value = LY.room.length; $('rwid').value = LY.room.width;
+  renderAll();
+}
+
+function renderAll() { drawRoom(); drawLights(); drawPresets(); drawSel(); }
+
+function drawRoom() {
+  const svg = $('room'); svg.innerHTML = '';
+  const w = LY.room.width, l = LY.room.length, m = 0.6;
+  svg.setAttribute('viewBox', `${-w / 2 - m} ${-m} ${w + 2 * m} ${l + 2 * m}`);
+  const mk = (tag, a, txt) => { const e = document.createElementNS(NS, tag); for (const k in a) e.setAttribute(k, a[k]); if (txt) e.textContent = txt; svg.appendChild(e); return e; };
+  const fs = Math.max(0.22, l / 40), r = Math.max(0.14, l / 55);
+  mk('rect', {x: -w / 2, y: 0, width: w, height: l, fill: 'none', stroke: '#8889', 'stroke-width': fs / 8});
+  mk('text', {x: 0, y: -0.15, 'text-anchor': 'middle', 'font-size': fs, fill: '#889'}, 'entrance');
+  mk('text', {x: 0, y: l + fs + 0.1, 'text-anchor': 'middle', 'font-size': fs, fill: '#889'}, 'window');
+  const act = activeP >= 0 ? LY.presets[activeP] : null;
+  for (const s of LY.spots) {
+    const inP = act && act.spots.includes(s.id);
+    const c = mk('circle', {cx: s.x, cy: s.y, r, fill: inP ? 'var(--accent)' : (s.z > 0 ? '#e8a33d88' : '#8888'),
+      stroke: s.id === selId ? 'var(--fg)' : '#8886', 'stroke-width': r / 4, style: 'cursor:grab'});
+    c.dataset.id = s.id;
+    mk('text', {x: s.x, y: s.y - r * 1.25, 'text-anchor': 'middle', 'font-size': fs * 0.8, fill: 'currentColor', 'pointer-events': 'none'}, short(s.name));
+    c.addEventListener('pointerdown', e => startDrag(e, s));
+  }
+}
+
+let drag = null;
+function svgPoint(e) {
+  const svg = $('room'), p = svg.createSVGPoint(); p.x = e.clientX; p.y = e.clientY;
+  return p.matrixTransform(svg.getScreenCTM().inverse());
+}
+function startDrag(e, s) {
+  e.preventDefault(); const p = svgPoint(e);
+  drag = {s, moved: false, x0: e.clientX, y0: e.clientY, dx: s.x - p.x, dy: s.y - p.y};
+  e.target.setPointerCapture(e.pointerId);
+  e.target.onpointermove = ev => {
+    if (!drag) return;
+    if (Math.hypot(ev.clientX - drag.x0, ev.clientY - drag.y0) > 4) drag.moved = true;
+    if (!drag.moved) return;
+    const q = svgPoint(ev), snap = v => Math.round(v / 0.05) * 0.05;
+    drag.s.x = +Math.max(-LY.room.width, Math.min(LY.room.width, snap(q.x + drag.dx))).toFixed(2);
+    drag.s.y = +Math.max(0, Math.min(LY.room.length, snap(q.y + drag.dy))).toFixed(2);
+    dirty = true; drawRoom(); drawSel();
+  };
+  e.target.onpointerup = () => {
+    const d = drag; drag = null;
+    if (d && !d.moved) tapSpot(d.s);
+  };
+}
+function tapSpot(s) {
+  if (activeP >= 0) {
+    const p = LY.presets[activeP], i = p.spots.indexOf(s.id);
+    if (i >= 0) p.spots.splice(i, 1);
+    else if (p.spots.length >= 10) { lnote('A preset can hold at most 10 lights (bridge limit).'); return; }
+    else p.spots.push(s.id);
+    dirty = true; drawPresets();
+  }
+  selId = s.id; drawRoom(); drawSel();
+}
+
+function drawSel() {
+  const s = selId && spotById(selId);
+  $('sel-card').hidden = !s;
+  if (!s) return;
+  $('sel-name').textContent = s.name;
+  $('sx').value = s.x; $('sy').value = s.y; $('sz').value = String(s.z); $('sg').value = s.group;
+}
+for (const [id, key, num] of [['sx', 'x', 1], ['sy', 'y', 1], ['sg', 'group', 0]])
+  $(id).onchange = e => { const s = spotById(selId); if (!s) return; s[key] = num ? +e.target.value : e.target.value; dirty = true; drawRoom(); };
+$('sz').onchange = e => { const s = spotById(selId); if (s) { s.z = +e.target.value; dirty = true; drawRoom(); } };
+for (const [id, key] of [['rlen', 'length'], ['rwid', 'width']])
+  $(id).onchange = e => { LY.room[key] = Math.max(1, +e.target.value || 1); dirty = true; drawRoom(); };
+
+function drawLights() {
+  const f = $('lfilter').value.toLowerCase(), box = $('llist'); box.innerHTML = '';
+  for (const l of LIGHTS) {
+    if (f && !l.name.toLowerCase().includes(f)) continue;
+    const row = document.createElement('label'); row.style.cssText = 'display:flex;gap:8px;padding:3px 0;align-items:center';
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!spotById(l.id); cb.disabled = !l.entertainment;
+    cb.onchange = () => toggleLight(l, cb.checked);
+    const t = document.createElement('span'); t.textContent = l.name + (l.entertainment ? '' : ' (no entertainment support)');
+    if (!l.entertainment) t.className = 'muted';
+    row.append(cb, t); box.appendChild(row);
+  }
+}
+$('lfilter').oninput = drawLights;
+
+function toggleLight(l, on) {
+  if (on) {
+    const n = LY.spots.length;
+    LY.spots.push({id: l.id, name: l.name, x: 0, y: +Math.min(LY.room.length, 0.5 + n * 0.5).toFixed(2), z: -0.5, group: ''});
+  } else {
+    LY.spots = LY.spots.filter(s => s.id !== l.id);
+    for (const p of LY.presets) p.spots = p.spots.filter(i => i !== l.id);
+    if (selId === l.id) selId = null;
+  }
+  dirty = true; renderAll();
+}
+
+function arrange(kind) {
+  const S = LY.spots, n = S.length; if (!n) return;
+  const L = LY.room.length, W = LY.room.width;
+  if (kind === 'line') S.forEach((s, i) => { s.x = 0; s.y = +(L * (i + 0.5) / n).toFixed(2); });
+  else {
+    const h = Math.ceil(n / 2);
+    S.forEach((s, i) => { const side = i < h ? -1 : 1, k = i < h ? i : i - h, m = side < 0 ? h : n - h;
+      s.x = side * W / 3; s.y = +(L * (k + 0.5) / m).toFixed(2); });
+  }
+  dirty = true; renderAll();
+}
+$('a-line').onclick = () => arrange('line');
+$('a-rails').onclick = () => arrange('rails');
+
+function drawPresets() {
+  const box = $('plist'); box.innerHTML = '';
+  if (!LY.presets.length) box.innerHTML = '<span class="muted">No presets yet. Use "Suggest presets" or "Add preset".</span>';
+  LY.presets.forEach((p, i) => {
+    const row = document.createElement('div'); row.className = 'row'; row.style.marginBottom = '6px';
+    const sel = document.createElement('button'); sel.textContent = (i === activeP ? 'editing' : 'edit members');
+    sel.className = i === activeP ? 'on' : ''; sel.onclick = () => { activeP = activeP === i ? -1 : i; drawRoom(); drawPresets(); };
+    const nm = document.createElement('input'); nm.value = p.name; nm.size = 20;
+    nm.onchange = () => { p.name = nm.value.trim() || p.name; dirty = true; };
+    const cnt = document.createElement('span'); cnt.className = 'muted'; cnt.textContent = `${p.spots.length}/10`;
+    const del = document.createElement('button'); del.textContent = 'Delete';
+    del.onclick = () => { LY.presets.splice(i, 1); if (activeP >= LY.presets.length) activeP = -1; dirty = true; drawRoom(); drawPresets(); };
+    row.append(sel, nm, cnt, del); box.appendChild(row);
+  });
+}
+$('p-add').onclick = () => {
+  let n = LY.presets.length + 1; while (LY.presets.some(p => p.name === 'Hue Show ' + n)) n++;
+  LY.presets.push({name: 'Hue Show ' + n, spots: []}); activeP = LY.presets.length - 1; dirty = true; drawRoom(); drawPresets();
+};
+$('p-sug').onclick = async () => {
+  if (LY.presets.length && !confirm('Replace your current presets with suggestions?')) return;
+  const r = await api('/api/layout/suggest', {layout: LY, prefix: 'Hue Show'});
+  if (r.error) { lnote(r.error); return; }
+  LY.presets = r.presets; activeP = -1; dirty = true; renderAll();
+  lnote(`${r.presets.length} presets suggested. Edit them if you like, then save.`);
+};
+
+async function saveLayout(apply) {
+  lnote(apply ? 'Saving and applying to the bridge...' : 'Saving...');
+  const r = await api(apply ? '/api/layout/apply' : '/api/layout', {layout: LY});
+  if (r.error) { lnote('Error: ' + r.error); return; }
+  dirty = false;
+  if (apply) { const p = r.report; lnote(`Applied: ${p.created.length} created, ${p.replaced.length} replaced, ${p.unchanged.length} unchanged` + (p.errors.length ? '. Errors: ' + p.errors.join('; ') : '.')); }
+  else lnote('Saved.');
+}
+$('l-save').onclick = () => saveLayout(false);
+$('l-apply').onclick = () => saveLayout(true);
+
+window.addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
 
 async function poll() { try { render(await api('/api/status')); } catch (e) {} setTimeout(poll, 700); }
 poll();

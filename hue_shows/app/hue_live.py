@@ -11,6 +11,7 @@ effects (hue_engine.py) and restores the lights on Stop / Ctrl+C.
 import argparse, collections, json, os, statistics, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hue_engine as eng
+import hue_layout as lay
 import hue_setup as hs
 import hue_stream as st
 
@@ -80,7 +81,7 @@ def b_flash(bc):
 def b_step(bc):
     """One spot per beat, entrance -> window, with a short fading trail."""
     def f(t, L):
-        rail = sorted([s for s in L if s.rank], key=lambda s: s.y)
+        rail = sorted(L, key=lambda s: (s.y, s.x))
         n = max(1, len(rail))
         k = max(0.0, 1 - bc.since() / 0.5)
         out = {s.id: (0, 0, 0) for s in L}
@@ -103,17 +104,33 @@ def b_chase_bpm(bc):
     return f
 
 
-# name -> (factory, suggested area or None, ambient)
+# name -> (factory, preset-name keyword to pin by default or None, ambient)
 CATALOG = {
     "wave":        (lambda bc: eng.fx_wave(), None, True),
     "ripple":      (lambda bc: eng.fx_ripple(), None, False),
     "chase":       (lambda bc: eng.fx_chase(), None, True),
-    "runner":      (lambda bc: eng.fx_runner(), "Attic Show Zigzag", False),
-    "beat pulse":  (b_pulse, "Attic Show Mix", False),
-    "beat flash":  (b_flash, "Attic Show Flash", False),
-    "beat step":   (b_step, "Attic Show Zigzag", False),
+    "runner":      (lambda bc: eng.fx_runner(), "zigzag", False),
+    "beat pulse":  (b_pulse, "mix", False),
+    "beat flash":  (b_flash, "flash", False),
+    "beat step":   (b_step, "zigzag", False),
     "beat chase":  (b_chase_bpm, None, True),
 }
+
+
+def preset_names():
+    d = lay.load()
+    return [p["name"] for p in d["presets"]] if d else []
+
+
+def default_area(effect):
+    """Pin an effect to a preset whose name contains its keyword (e.g. 'zigzag'),
+    otherwise let the engine choose."""
+    kw = CATALOG[effect][1]
+    if kw:
+        for n in preset_names():
+            if kw in n.lower() and "zigzagr" not in n.lower():
+                return n
+    return "auto"
 
 
 # ---- live runner ------------------------------------------------------------
@@ -198,7 +215,7 @@ class Live:
                 "configured": hs.is_configured(), "default_bridge": os.environ.get("HUE_BRIDGE", ""),
                 "bpm": self.bc.bpm, "beats": self.bc.count, "active": self.bc.active, "sim_bpm": self.bc.sim_bpm,
                 "effects": {k: v[1] for k, v in CATALOG.items()},
-                "areas": ["auto"] + list(eng.PRESETS)}
+                "areas": ["auto"] + preset_names()}
 
 
 LIVE = Live()
@@ -220,6 +237,16 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/status":
             return self._json(LIVE.status())
+        if self.path == "/api/layout":
+            if not hs.is_configured():
+                return self._json({"error": "bridge not set up"}, 400)
+            try:
+                cfg = hs.load_cfg()
+                lights = lay.discover(cfg)
+                layout = lay.load_or_migrate(cfg, lights) or lay.empty()
+                return self._json({"layout": layout, "lights": lay.public_lights(lights)})
+            except Exception as ex:
+                return self._json({"error": f"cannot read bridge: {ex}"}, 502)
         if self.path in ("/", "/index.html"):
             b = open(os.path.join(HERE, "hue_ui.html"), "rb").read()
             self.send_response(200)
@@ -230,6 +257,28 @@ class H(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
+    def _layout_post(self, body):
+        if not hs.is_configured():
+            return self._json({"error": "bridge not set up"}, 400)
+        try:
+            layout = lay.validate(body.get("layout", body))
+        except ValueError as ex:
+            return self._json({"error": str(ex)}, 400)
+        if self.path == "/api/layout/suggest":
+            return self._json({"presets": lay.suggest_presets(layout["spots"], str(body.get("prefix", "Show"))[:20])})
+        if LIVE.running:
+            return self._json({"error": "stop the lights before changing the layout"}, 409)
+        try:
+            if self.path == "/api/layout":
+                lay.save(layout)
+                return self._json({"ok": True, "layout": layout})
+            cfg = hs.load_cfg()                      # /api/layout/apply
+            lay.save(layout)
+            ents = {d["id"]: d["ent"] for d in lay.discover(cfg)}
+            return self._json({"ok": True, "report": lay.sync_areas(cfg, layout, ents)})
+        except Exception as ex:
+            return self._json({"error": f"bridge error: {ex}"}, 502)
+
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
         try:
@@ -239,15 +288,17 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/api/beat":
             LIVE.bc.beat(float(body.get("strength", 1.0)))
             return self._json({"ok": True})
+        if self.path in ("/api/layout", "/api/layout/suggest", "/api/layout/apply"):
+            return self._layout_post(body)
         if self.path == "/api/set":
             s = LIVE.state
             if body.get("effect") in CATALOG:
                 s["effect"] = body["effect"]
                 if "area" not in body:
-                    s["area"] = CATALOG[body["effect"]][1] or "auto"
+                    s["area"] = default_area(body["effect"])
                 if "ambient" not in body:
                     s["ambient"] = CATALOG[body["effect"]][2]
-            if "area" in body and (body["area"] == "auto" or body["area"] in eng.PRESETS):
+            if "area" in body and (body["area"] == "auto" or body["area"] in preset_names()):
                 s["area"] = body["area"]
             if "ambient" in body:
                 s["ambient"] = bool(body["ambient"])

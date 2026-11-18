@@ -1,11 +1,11 @@
-"""Hue show engine: effects on a 20-spot layout, shown through 10-light streams.
+"""Hue show engine: effects on a layout, shown through 10-light streams.
 
-An effect is a function  effect(t, layout) -> {spot_id: (r, g, b)}  that colours
-ALL 20 spots. The engine then decides how to show it on a bridge that streams
-only 10 lights from one area at a time:
+An effect is a function  effect(t, spots) -> {spot_id: (r, g, b)}  that colours
+ALL spots of the layout. The engine then decides how to show it on a bridge that
+streams only 10 lights from one area at a time:
 
-  * stream  - the best-matching preset area (10 lights, 50 Hz), chosen by
-              scoring each area against the upcoming ~1 s of the effect
+  * stream  - the best-matching preset area (<= 10 lights, 50 Hz), chosen by
+              scoring each area against the upcoming ~4 s of the effect
               (brightness x motion), with dwell time + hysteresis so the
               0.3 s area switch only happens when it pays off.
   * ambient - lights outside the streamed area get a gentle, low-passed,
@@ -13,44 +13,24 @@ only 10 lights from one area at a time:
               or stay dark when the segment says ambient=False.
   * pin     - a segment can pin a specific area ("use just these 10").
 
-Run:  python hue_engine.py          (demo show)
+Layout and presets come from hue_layout (editable in the web UI).
 Saves and restores light state.
 """
 import colorsys, math, threading, time
+import hue_layout as lay
 import hue_setup as hs
 import hue_stream as st
 
-# ---- layout -----------------------------------------------------------------
+
 class Spot:
-    def __init__(self, s):
-        self.id, self.name, self.ent = s["id"], s["name"], s["ent"]
-        self.rail, self.row, self.idx = s["rail"], s["row"], s["idx"]
-        self.x, self.y, self.z = hs.position_m(self.rail, self.row, self.idx)
-        self.rank = (self.row - 1) * 4 + self.idx if self.rail in "LR" else None   # 1..8 along a rail
+    def __init__(self, d, ent):
+        self.id, self.name, self.ent = d["id"], d["name"], ent
+        self.x, self.y, self.z, self.group = d["x"], d["y"], d["z"], d.get("group", "")
 
 
-def rails(sp, which, ranks=range(1, 9)):
-    return [s for s in sp if s.rail in which and s.rank in ranks]
-
-
-def crossbar(sp, idxs):
-    return [s for s in sp if s.rail == "T" and s.idx in idxs]
-
-
-# preset 10-light areas (bridge cap). name -> selector(spots) -> list[Spot]
-PRESETS = {
-    "Attic Show L":      lambda sp: rails(sp, "L") + crossbar(sp, (1, 2)),
-    "Attic Show R":      lambda sp: rails(sp, "R") + crossbar(sp, (3, 4)),
-    "Attic Show Mix":    lambda sp: rails(sp, "LR", (1, 4, 5, 8)) + crossbar(sp, (2, 3)),
-    "Attic Show Front":  lambda sp: rails(sp, "LR", (1, 2, 3, 4)) + crossbar(sp, (2, 3)),
-    "Attic Show Back":   lambda sp: rails(sp, "LR", (5, 6, 7, 8)) + crossbar(sp, (1, 4)),
-    "Attic Show Spread": lambda sp: rails(sp, "L", (2, 4, 6, 8)) + rails(sp, "R", (1, 3, 5, 7)) + crossbar(sp, (1, 4)),
-    # front->back zigzag: L1, R2, L3, R4 ... (no crossbar); mirror starts on the right
-    "Attic Show Zigzag":  lambda sp: rails(sp, "L", (1, 3, 5, 7)) + rails(sp, "R", (2, 4, 6, 8)),
-    "Attic Show ZigzagR": lambda sp: rails(sp, "R", (1, 3, 5, 7)) + rails(sp, "L", (2, 4, 6, 8)),
-    # all 4 crossbar spots + 3 evenly spread rail spots per side (staggered L/R)
-    "Attic Show Flash":   lambda sp: crossbar(sp, (1, 2, 3, 4)) + rails(sp, "L", (1, 4, 7)) + rails(sp, "R", (2, 5, 8)),
-}
+def span_of(L):
+    ys = [s.y for s in L] or [0.0]
+    return min(ys), max(ys)
 
 
 # ---- effects (all return {spot.id: (r,g,b)}) --------------------------------
@@ -64,8 +44,11 @@ def fx_wave(speed=1.8, wavelength=4.0):
     return f
 
 
-def fx_ripple(speed=2.2, reach=3.6, centre=4.0):
+def fx_ripple(speed=2.2):
+    """Rings expand from the middle of the room outwards."""
     def f(t, L):
+        lo, hi = span_of(L)
+        centre, reach = (lo + hi) / 2, max(1.0, (hi - lo) / 2 + 0.5)
         pos = (t * speed) % reach
         out = {}
         for s in L:
@@ -85,10 +68,11 @@ def fx_strobe(rate=4.0, duty=0.2, colour=(1, 1, 1)):
 def fx_chase(speed=3.0, hue=0.0, width=1.6):
     """Bright band running entrance -> window and back (ping-pong)."""
     def f(t, L):
-        span = 7.0
+        lo, hi = span_of(L)
+        span = max(1.0, hi - lo)
         p = (t * speed) % (2 * span)
         p = p if p < span else 2 * span - p
-        pos = 1.0 + p
+        pos = lo + p
         return {s.id: hsv(hue + 0.05 * s.y, 1.0, max(0.0, 1 - abs(s.y - pos) / width)) for s in L}
     return f
 
@@ -100,19 +84,45 @@ def fx_pulse(bpm=120, hue=0.8):
     return f
 
 
+def fx_runner(speed=4.0, hue=0.6, width=1.1):
+    """One bright spot running entrance -> window, with a short trail, looping."""
+    def f(t, L):
+        lo, hi = span_of(L)
+        pos = lo - 0.3 + (t * speed) % max(1.0, hi - lo + 0.6)
+        return {s.id: hsv(hue + 0.04 * s.y, 0.9, max(0.0, 1 - abs(s.y - pos) / width) ** 1.2) for s in L}
+    return f
+
+
 # ---- engine -----------------------------------------------------------------
 class Engine:
-    def __init__(self):
+    def __init__(self, layout=None):
         self.cfg = hs.load_cfg()
-        spots = hs.attic_lights(self.cfg)
-        hs.attach_entertainment_ids(self.cfg, spots)
-        self.spots = [Spot(s) for s in spots]
+        lights = lay.discover(self.cfg)
+        layout = layout or lay.load_or_migrate(self.cfg, lights)
+        if not layout or not layout["spots"]:
+            raise RuntimeError("no layout yet: add your lights in the Layout tab")
+        self.layout = layout
+        found = {d["id"]: d for d in lights}
+        ents = {i: d["ent"] for i, d in found.items()}
+        self.spots = [Spot(d, ents[d["id"]]) for d in layout["spots"]
+                      if d["id"] in found and ents.get(d["id"])]
+        if not self.spots:
+            raise RuntimeError("none of the layout's lights support entertainment streaming")
         self.by_id = {s.id: s for s in self.spots}
         self.by_ent = {s.ent: s for s in self.spots}
-        self.saved = {s["id"]: hs.snapshot(s["light"]) for s in spots}
+        self.saved = {s.id: hs.snapshot(found[s.id]["light"]) for s in self.spots}
         self.app_id = st.application_id(self.cfg)
-        self.areas = self._ensure_areas()
-        self.members = {n: {s.id for s in PRESETS[n](self.spots)} for n in PRESETS}
+        self.members = {p["name"]: {i for i in p["spots"] if i in self.by_id}
+                        for p in layout["presets"] if any(i in self.by_id for i in p["spots"])}
+        if not self.members:
+            raise RuntimeError("no presets yet: use 'Suggest presets' in the Layout tab")
+        report = lay.sync_areas(self.cfg, layout, ents)
+        for n in report["created"] + report["replaced"]:
+            print(f"area {n}: created/updated")
+        self.areas = {a["metadata"]["name"]: a for a in
+                      hs.v2(self.cfg, "GET", "entertainment_configuration")["data"]
+                      if a["metadata"]["name"] in self.members}
+        self.members = {n: m for n, m in self.members.items() if n in self.areas}
         self.cur = None                       # (name, area, chans, dtls)
         self.ambient_on = False
         self.rest_ids = set()
@@ -121,24 +131,6 @@ class Engine:
         self.stop_flag = threading.Event()
         self.log = []
         self.rest_updates = 0
-
-    # -- bridge areas
-    def _ensure_areas(self):
-        have = {a["metadata"]["name"]: a for a in hs.v2(self.cfg, "GET", "entertainment_configuration")["data"]}
-        for name, sel in PRESETS.items():
-            if name in have:
-                continue
-            members = sel(self.spots)
-            assert 0 < len(members) <= 10, (name, len(members))
-            body = {"metadata": {"name": name}, "configuration_type": "music",
-                    "locations": {"service_locations": [
-                        {"service": {"rid": s.ent, "rtype": "entertainment"},
-                         "position": hs.to_hue(s.x, s.y, s.z), "positions": [hs.to_hue(s.x, s.y, s.z)],
-                         "equalization_factor": 1} for s in members]}}
-            hs.v2(self.cfg, "POST", "entertainment_configuration", body)
-            print(f"created area {name}")
-        return {a["metadata"]["name"]: a for a in hs.v2(self.cfg, "GET", "entertainment_configuration")["data"]
-                if a["metadata"]["name"] in PRESETS}
 
     def _close(self):
         if not self.cur:
@@ -182,7 +174,7 @@ class Engine:
         return total
 
     def best_area(self, effect, t):
-        scores = {n: self.score(n, effect, t) for n in PRESETS}
+        scores = {n: self.score(n, effect, t) for n in self.members}
         return max(scores, key=scores.get), scores
 
     # -- ambient (REST) for lights outside the stream
@@ -230,7 +222,7 @@ class Engine:
                     pass
             time.sleep(0.05)
 
-    # -- run a show
+    # -- run a scripted show (segments); live mode lives in hue_live
     def run(self, show, hz=50.0, dwell=4.0, gain=1.5):
         th = threading.Thread(target=self._ambient_loop, daemon=True)
         th.start()
@@ -251,7 +243,7 @@ class Engine:
                         last_sel = now
                         best, sc = self.best_area(effect, t)
                         if not self.cur:
-                            self.switch(best, now, "start"); n = 0; t0 = time.time() - t;
+                            self.switch(best, now, "start"); n = 0; t0 = time.time() - t
                         elif best != self.cur[0] and sc[best] > gain * sc[self.cur[0]] and now - self.log[-1][0] >= dwell:
                             self.switch(best, now, f"score {sc[best]:.1f} vs {sc[self.cur[0]]:.1f}")
                             n = 0; t0 = time.time() - t
@@ -284,36 +276,17 @@ class Engine:
             print("Previous light state restored.")
 
 
-def demo_show():
+def demo_show(presets):
+    """Generic demo: auto-picked areas for wave / ripple / chase, pinned strobe."""
+    pin = presets[0] if presets else None
     return [
         {"name": "wave, auto, ambient wash", "effect": fx_wave(), "secs": 8},
         {"name": "ripple from the middle, auto, others dark", "effect": fx_ripple(), "secs": 7, "ambient": False},
-        {"name": "flash, pinned to Spread (whole-room coverage)", "effect": fx_strobe(), "secs": 5,
-         "pin": "Attic Show Spread", "ambient": False},
-        {"name": "chase entrance->window, auto, ambient wash", "effect": fx_chase(), "secs": 9},
-        {"name": "pulse, auto, others dark", "effect": fx_pulse(), "secs": 6, "ambient": False},
-    ]
-
-
-def fx_runner(speed=4.0, hue=0.6, width=1.1):
-    """One bright spot running entrance -> window, with a short trail, looping."""
-    def f(t, L):
-        pos = 1.2 + (t * speed) % 6.6
-        return {s.id: hsv(hue + 0.04 * s.y, 0.9, max(0.0, 1 - abs(s.y - pos) / width) ** 1.2) for s in L}
-    return f
-
-
-def demo_show2():
-    return [
-        {"name": "zigzag travel, front->back, left first", "effect": fx_runner(), "secs": 8,
-         "pin": "Attic Show Zigzag", "ambient": False},
-        {"name": "zigzag travel, right first", "effect": fx_runner(hue=0.05), "secs": 6,
-         "pin": "Attic Show ZigzagR", "ambient": False},
-        {"name": "flash: crossbar + evenly spread rails", "effect": fx_strobe(rate=5), "secs": 6,
-         "pin": "Attic Show Flash", "ambient": False},
+        {"name": "strobe, pinned", "effect": fx_strobe(), "secs": 5, "pin": pin, "ambient": False},
+        {"name": "chase, auto, ambient wash", "effect": fx_chase(), "secs": 9},
     ]
 
 
 if __name__ == "__main__":
-    import sys
-    Engine().run(demo_show2() if "demo2" in sys.argv else demo_show())
+    e = Engine()
+    e.run(demo_show(list(e.members)))
