@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attic Show</title>
+<style>
+  :root { --bg:#fff; --fg:#1b1f24; --muted:#667; --card:#f3f4f7; --accent:#6d3df0; --ok:#1a8a4a; --bad:#c0392b; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14161a; --fg:#e8eaee; --muted:#9aa0ab; --card:#1f232a; --accent:#9b7bff; --ok:#4cc27a; --bad:#ff7a6b; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.4 system-ui, sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:16px; }
+  h1 { font-size:22px; margin:8px 0 16px; }
+  .card { background:var(--card); border-radius:12px; padding:14px; margin-bottom:12px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button, select, input { font:inherit; padding:8px 12px; border-radius:8px; border:1px solid #8884; background:var(--bg); color:var(--fg); }
+  button.primary { background:var(--accent); color:#fff; border-color:transparent; }
+  button.on { outline:2px solid var(--accent); }
+  .effects { display:grid; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); gap:8px; }
+  .muted { color:var(--muted); font-size:14px; }
+  .meter { height:10px; background:#8883; border-radius:5px; overflow:hidden; }
+  .meter > div { height:100%; width:0; background:var(--accent); }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:#8886; margin-right:6px; }
+  .dot.on { background:var(--ok); }
+  .big { font-size:28px; font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Attic Show</h1>
+
+  <div class="card">
+    <div class="row">
+      <button id="go" class="primary">Start lights</button>
+      <span><span id="dot" class="dot"></span><span id="state" class="muted">stopped</span></span>
+    </div>
+    <p id="info" class="muted" style="margin:8px 0 0"></p>
+  </div>
+
+  <div class="card">
+    <div class="muted" style="margin-bottom:8px">Effect</div>
+    <div id="effects" class="effects"></div>
+    <div class="row" style="margin-top:12px">
+      <label class="muted">Area <select id="area"></select></label>
+      <label class="muted"><input type="checkbox" id="ambient"> ambient wash on the other lights</label>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="muted" style="margin-bottom:8px">Music</div>
+    <div class="row">
+      <button id="mic">Use microphone</button>
+      <label class="muted">or simulate
+        <select id="sim"><option value="0">off</option><option>100</option><option>120</option><option>128</option><option>140</option></select> BPM
+      </label>
+    </div>
+    <div class="meter" style="margin:12px 0"><div id="level"></div></div>
+    <div class="row">
+      <label class="muted">Silence gate <input type="range" id="gate" min="2" max="80" value="15"></label>
+      <label class="muted">Beat sensitivity <input type="range" id="sens" min="110" max="250" value="150"></label>
+      <span class="dot" id="beatdot" title="beat detected"></span>
+    </div>
+    <div class="row"><span class="big" id="bpm">-</span><span class="muted">BPM</span>
+      <span class="muted" style="margin-left:16px">beats <span id="beats">0</span></span></div>
+    <p class="muted" id="micnote" style="margin:8px 0 0">Microphone only works on localhost or https.</p>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let status = null, micOn = false;
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {method:'POST', body:JSON.stringify(body)});
+  return r.json();
+}
+
+function render(s) {
+  status = s;
+  $('go').textContent = s.running ? 'Stop lights' : 'Start lights';
+  $('dot').className = 'dot' + (s.running ? ' on' : '');
+  $('state').textContent = s.running ? 'running' : 'stopped';
+  $('info').textContent = s.info.error ? ('error: ' + s.info.error)
+    : s.running ? `area: ${s.info.area || '-'} | ${s.info.fps} fps | ${s.info.switches} switches | ${s.info.rest} ambient updates` : '';
+  if (!$('effects').children.length) {
+    for (const name of Object.keys(s.effects)) {
+      const b = document.createElement('button'); b.textContent = name; b.dataset.n = name;
+      b.onclick = async () => render(await api('/api/set', {effect:name}));
+      $('effects').appendChild(b);
+    }
+    for (const a of s.areas) { const o = document.createElement('option'); o.value = o.textContent = a; $('area').appendChild(o); }
+    $('area').onchange = async e => render(await api('/api/set', {area:e.target.value}));
+    $('ambient').onchange = async e => render(await api('/api/set', {ambient:e.target.checked}));
+    $('sim').onchange = async e => render(await api('/api/set', {sim_bpm:+e.target.value}));
+  }
+  for (const b of $('effects').children) b.className = b.dataset.n === s.state.effect ? 'on' : '';
+  $('area').value = s.state.area;
+  $('ambient').checked = s.state.ambient;
+  if (document.activeElement !== $('sim')) $('sim').value = String(s.sim_bpm || 0);
+  $('bpm').textContent = s.bpm || '-';
+  $('beats').textContent = s.beats;
+}
+
+$('go').onclick = async () => render(await api(status && status.running ? '/api/stop' : '/api/start', {}));
+
+// ---- microphone beat detection: low-band energy vs. running average -------
+let ctx, an, buf, hist = [], lastBeat = 0, stream;
+async function toggleMic() {
+  if (micOn) {
+    micOn = false; $('mic').textContent = 'Use microphone'; $('mic').className = '';
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    $('level').style.width = '0';
+    return;
+  }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false, noiseSuppression:false, autoGainControl:false}});
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    // bass only: low-pass ~150 Hz, then measure linear loudness (RMS) in the time domain
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 150; lp.Q.value = 0.7;
+    an = ctx.createAnalyser(); an.fftSize = 1024; an.smoothingTimeConstant = 0;
+    ctx.createMediaStreamSource(stream).connect(lp); lp.connect(an);
+    buf = new Float32Array(an.fftSize); hist = [];
+    micOn = true; $('mic').textContent = 'Microphone on'; $('mic').className = 'on';
+    $('sim').value = '0'; api('/api/set', {sim_bpm:0});
+    loop();
+  } catch (e) { $('micnote').textContent = 'Microphone unavailable: ' + e.message; }
+}
+$('mic').onclick = toggleMic;
+
+function loop() {
+  if (!micOn) return;
+  an.getFloatTimeDomainData(buf);
+  let sum = 0; for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+  const e = Math.sqrt(sum / buf.length);                       // linear bass loudness, 0..1
+  const gate = +$('gate').value / 1000;                        // silence gate (RMS)
+  const ratio = +$('sens').value / 100;                        // jump vs recent average
+  $('level').style.width = Math.min(100, e * 600) + '%';
+  hist.push(e); if (hist.length > 90) hist.shift();
+  const avg = hist.reduce((a, b) => a + b, 0) / hist.length;
+  const now = performance.now();
+  if (e > gate && e > avg * ratio && now - lastBeat > 250) {
+    lastBeat = now;
+    $('beatdot').classList.add('on'); setTimeout(() => $('beatdot').classList.remove('on'), 90);
+    api('/api/beat', {strength: Math.min(1, (e - avg) / (e + 1e-6) + 0.3)});
+  }
+  requestAnimationFrame(loop);
+}
+
+async function poll() { try { render(await api('/api/status')); } catch (e) {} setTimeout(poll, 700); }
+poll();
+</script>
+</body>
+</html>
