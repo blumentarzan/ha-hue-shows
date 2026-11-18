@@ -28,6 +28,15 @@
 <main>
   <h1>Attic Show</h1>
 
+  <div class="card" id="setup" hidden>
+    <div class="muted" style="margin-bottom:8px">Connect your Hue Bridge</div>
+    <div class="row">
+      <input id="bridge" placeholder="Bridge IP, e.g. 192.168.1.20" size="24">
+      <button id="reg" class="primary">Connect</button>
+    </div>
+    <p class="muted" id="regnote" style="margin:8px 0 0">Click Connect, then press the round link button on the bridge within 30 seconds.</p>
+  </div>
+
   <div class="card">
     <div class="row">
       <button id="go" class="primary">Start lights</button>
@@ -70,12 +79,25 @@ const $ = id => document.getElementById(id);
 let status = null, micOn = false;
 
 async function api(path, body) {
-  const r = await fetch(path, body === undefined ? {} : {method:'POST', body:JSON.stringify(body)});
+  // relative URL: works under Home Assistant Ingress (path prefix) as well as standalone
+  const r = await fetch(path.replace(/^\//, ''), body === undefined ? {} : {method:'POST', body:JSON.stringify(body)});
   return r.json();
 }
 
+$('reg').onclick = async () => {
+  $('reg').disabled = true; $('regnote').textContent = 'Press the link button on the bridge now...';
+  try {
+    const r = await api('/api/register', {bridge: $('bridge').value});
+    $('regnote').textContent = r.ok ? 'Connected.' : ('Failed: ' + (r.error || 'unknown error'));
+  } catch (e) { $('regnote').textContent = 'Failed: ' + e.message; }
+  $('reg').disabled = false;
+};
+
 function render(s) {
   status = s;
+  $('setup').hidden = s.configured;
+  if (!$('bridge').value && s.default_bridge) $('bridge').value = s.default_bridge;
+  $('go').disabled = !s.configured;
   $('go').textContent = s.running ? 'Stop lights' : 'Start lights';
   $('dot').className = 'dot' + (s.running ? ' on' : '');
   $('state').textContent = s.running ? 'running' : 'stopped';

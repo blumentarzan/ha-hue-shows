@@ -12,7 +12,7 @@ certificate, so TLS verification is skipped for this LAN-only connection.
 """
 import argparse, json, os, re, ssl, sys, time, urllib.request
 
-CFG = os.path.expanduser("~/.hue_show.json")
+CFG = os.environ.get("HUE_SHOW_CONFIG") or os.path.expanduser("~/.hue_show.json")
 NAME_RE = re.compile(r"Spot DG ([LRT])(\d)\.(\d)")
 
 # ---- room model (metres): origin at entrance, y runs to the window ----------
@@ -68,21 +68,34 @@ def v2(cfg, method, path, body=None):
 
 
 # ---- commands ----------------------------------------------------------------
-def cmd_register(a):
-    print("Press the link button on the bridge now (waiting up to 30 s)...")
-    for _ in range(15):
-        r = call("POST", f"https://{a.bridge}/api",
+def is_configured():
+    return os.path.exists(CFG)
+
+
+def register(bridge, wait=30):
+    """Register with the bridge (link button must be pressed). Saves credentials
+    to CFG. Returns True on success, False if the button was not pressed in time."""
+    for _ in range(max(1, int(wait / 2))):
+        r = call("POST", f"https://{bridge}/api",
                  {"devicetype": "hue_show#setup", "generateclientkey": True})
         ok = r[0].get("success") if r else None
         if ok:
-            cfg = {"bridge": a.bridge, "username": ok["username"], "clientkey": ok["clientkey"]}
+            cfg = {"bridge": bridge, "username": ok["username"], "clientkey": ok["clientkey"]}
+            os.makedirs(os.path.dirname(CFG) or ".", exist_ok=True)
             fd = os.open(CFG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as f:
                 json.dump(cfg, f)
-            print(f"Registered. Credentials saved to {CFG}")
-            return
+            return True
         time.sleep(2)
-    sys.exit("Link button was not pressed in time. Try again.")
+    return False
+
+
+def cmd_register(a):
+    print("Press the link button on the bridge now (waiting up to 30 s)...")
+    if register(a.bridge):
+        print(f"Registered. Credentials saved to {CFG}")
+    else:
+        sys.exit("Link button was not pressed in time. Try again.")
 
 
 def attic_lights(cfg):

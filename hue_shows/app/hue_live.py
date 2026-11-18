@@ -11,6 +11,7 @@ effects (hue_engine.py) and restores the lights on Stop / Ctrl+C.
 import argparse, collections, json, os, statistics, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hue_engine as eng
+import hue_setup as hs
 import hue_stream as st
 
 
@@ -194,6 +195,7 @@ class Live:
 
     def status(self):
         return {"running": self.running, "state": self.state, "info": self.info,
+                "configured": hs.is_configured(), "default_bridge": os.environ.get("HUE_BRIDGE", ""),
                 "bpm": self.bc.bpm, "beats": self.bc.count, "active": self.bc.active, "sim_bpm": self.bc.sim_bpm,
                 "effects": {k: v[1] for k, v in CATALOG.items()},
                 "areas": ["auto"] + list(eng.PRESETS)}
@@ -252,7 +254,18 @@ class H(BaseHTTPRequestHandler):
             if "sim_bpm" in body:
                 LIVE.bc.sim_bpm = max(0.0, min(200.0, float(body["sim_bpm"])))
             return self._json(LIVE.status())
+        if self.path == "/api/register":
+            bridge = str(body.get("bridge", "")).strip()
+            if not bridge or not all(c.isalnum() or c in ".-:" for c in bridge):
+                return self._json({"ok": False, "error": "enter the bridge IP address"}, 400)
+            try:
+                ok = hs.register(bridge, wait=30)       # press the link button during this window
+            except Exception as ex:
+                return self._json({"ok": False, "error": f"cannot reach bridge: {ex}"})
+            return self._json({"ok": ok, "error": None if ok else "link button not pressed in time"})
         if self.path == "/api/start":
+            if not hs.is_configured():
+                return self._json({"error": "bridge not set up"}, 400)
             LIVE.start()
             return self._json(LIVE.status())
         if self.path == "/api/stop":

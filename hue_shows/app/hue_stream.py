@@ -18,16 +18,28 @@ CIPHER = b"PSK-AES128-GCM-SHA256"
 SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE = 2, 3
 
 # ---- OpenSSL via ctypes -----------------------------------------------------
-_dlls = os.path.join(os.path.dirname(sys.executable), "DLLs")
-if hasattr(os, "add_dll_directory") and os.path.isdir(_dlls):
-    os.add_dll_directory(_dlls)
-_sfx = "-arm64" if "arm64" in sys.executable.lower() or os.path.exists(os.path.join(_dlls, "libssl-3-arm64.dll")) else ("-x64" if os.name == "nt" else "")
-try:
-    crypto = ctypes.CDLL(os.path.join(_dlls, f"libcrypto-3{_sfx}.dll"))
-    libssl = ctypes.CDLL(os.path.join(_dlls, f"libssl-3{_sfx}.dll"))
-except OSError:
+def _load_openssl():
+    """Windows: the OpenSSL 3 DLLs that ship with Python. Linux (HA add-on):
+    system libssl.so.3 / libcrypto.so.3 (apk add openssl)."""
+    if os.name == "nt":
+        d = os.path.join(os.path.dirname(sys.executable), "DLLs")
+        if hasattr(os, "add_dll_directory") and os.path.isdir(d):
+            os.add_dll_directory(d)
+        sfx = "-arm64" if os.path.exists(os.path.join(d, "libssl-3-arm64.dll")) else "-x64"
+        return (ctypes.CDLL(os.path.join(d, f"libcrypto-3{sfx}.dll")),
+                ctypes.CDLL(os.path.join(d, f"libssl-3{sfx}.dll")))
     from ctypes.util import find_library
-    crypto, libssl = ctypes.CDLL(find_library("crypto")), ctypes.CDLL(find_library("ssl"))
+    last = None
+    for c, s in (("libcrypto.so.3", "libssl.so.3"), (find_library("crypto"), find_library("ssl"))):
+        try:
+            if c and s:
+                return ctypes.CDLL(c), ctypes.CDLL(s)
+        except OSError as e:
+            last = e
+    raise OSError(f"OpenSSL 3 libraries not found ({last})")
+
+
+crypto, libssl = _load_openssl()
 
 c_vp, c_i, c_l = ctypes.c_void_p, ctypes.c_int, ctypes.c_long
 PSK_CB = ctypes.CFUNCTYPE(ctypes.c_uint, c_vp, ctypes.c_char_p, c_vp, ctypes.c_uint, c_vp, ctypes.c_uint)
