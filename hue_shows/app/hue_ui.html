@@ -29,6 +29,7 @@
   <h1>Hue Shows</h1>
   <div class="row" style="margin-bottom:12px">
     <button id="t-show" class="on">Show</button>
+    <button id="t-timeline">Timeline</button>
     <button id="t-layout">Layout</button>
   </div>
   <div id="tab-show">
@@ -78,6 +79,43 @@
     <p class="muted" id="micnote" style="margin:8px 0 0">Microphone only works on localhost or https.</p>
   </div>
   </div><!-- /tab-show -->
+
+  <div id="tab-timeline" hidden>
+    <div class="card">
+      <div class="muted" style="margin-bottom:8px">Track</div>
+      <input type="file" id="afile" accept="audio/*">
+      <p class="muted" id="anote" style="margin:8px 0">Choose an audio file. It is analysed in your browser (tempo, beats, loud and quiet parts); nothing is uploaded.</p>
+      <audio id="aud" controls style="width:100%"></audio>
+      <div class="row" style="margin-top:8px">
+        <label class="muted">Lights offset <input type="range" id="toff" min="-300" max="300" step="10" value="0" style="vertical-align:middle"> <span id="toffv">0</span> ms</label>
+        <span class="muted">+ lights earlier, - later (speaker latency)</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <canvas id="tcv" style="width:100%;height:120px;display:block;border-radius:8px;background:var(--bg);cursor:pointer"></canvas>
+      <div class="row" style="margin-top:8px"><span class="muted" id="tinfo">no track</span></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="margin-bottom:8px">
+        <button id="c-auto" class="primary">Auto-choreograph</button>
+        <button id="c-add">Add cue at playhead</button>
+      </div>
+      <div id="cuelist"></div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <input id="sname" placeholder="show name" size="18">
+        <button id="s-save">Save show</button>
+        <select id="slist"></select>
+        <button id="s-load">Load</button>
+        <button id="s-del">Delete</button>
+      </div>
+      <p class="muted" id="snote" style="margin:8px 0 0">A saved show keeps the analysis and cues, not the audio. Choose the same audio file again after loading.</p>
+    </div>
+  </div>
 
   <div id="tab-layout" hidden>
     <div class="card">
@@ -229,11 +267,14 @@ const spotById = id => LY.spots.find(s => s.id === id);
 const lnote = t => { $('lnote').textContent = t; };
 
 function showTab(name) {
-  $('tab-show').hidden = name !== 'show'; $('tab-layout').hidden = name !== 'layout';
-  $('t-show').className = name === 'show' ? 'on' : ''; $('t-layout').className = name === 'layout' ? 'on' : '';
+  for (const t of ['show', 'timeline', 'layout']) {
+    $('tab-' + t).hidden = name !== t; $('t-' + t).className = name === t ? 'on' : '';
+  }
   if (name === 'layout' && !loaded) loadLayout();
+  if (name === 'timeline') { refreshShows(); drawTl(); }
 }
 $('t-show').onclick = () => showTab('show');
+$('t-timeline').onclick = () => showTab('timeline');
 $('t-layout').onclick = () => showTab('layout');
 
 async function loadLayout() {
@@ -392,6 +433,278 @@ $('l-save').onclick = () => saveLayout(false);
 $('l-apply').onclick = () => saveLayout(true);
 
 window.addEventListener('beforeunload', e => { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
+
+// ---- timeline: audio analysis (runs in the browser) ---------------------------
+function fft(re, im) {                                   // in-place radix-2
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const a = i + k, b = a + len / 2, tr = re[b] * cr - im[b] * ci, ti = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+        const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+      }
+    }
+  }
+}
+
+function analyzeSamples(x, sr) {
+  const WIN = 1024, HOP = 512, fr = sr / HOP, N = Math.max(0, Math.floor((x.length - WIN) / HOP));
+  const dur = x.length / sr;
+  if (N < fr * 8) throw new Error('track too short to analyse');
+  const hann = new Float64Array(WIN).map((_, i) => 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (WIN - 1)));
+  const binHz = sr / WIN, kmax = Math.min(WIN / 2 - 1, Math.floor(5000 / binHz)), kbass = Math.floor(200 / binHz);
+  const re = new Float64Array(WIN), im = new Float64Array(WIN), prev = new Float64Array(kmax + 1);
+  const o = new Float64Array(N), oL = new Float64Array(N), oH = new Float64Array(N), rms = new Float64Array(N);
+  for (let n = 0; n < N; n++) {
+    let e = 0;
+    for (let i = 0; i < WIN; i++) { const v = x[n * HOP + i]; re[i] = v * hann[i]; im[i] = 0; e += v * v; }
+    rms[n] = Math.sqrt(e / WIN);
+    fft(re, im);
+    let fl = 0, fh = 0;
+    for (let k = 1; k <= kmax; k++) {
+      const l = Math.log1p(Math.hypot(re[k], im[k]) * 4);
+      const d = l - prev[k]; prev[k] = l;
+      if (d > 0) { if (k <= kbass) fl += d; else fh += d; }
+    }
+    oL[n] = fl; oH[n] = fh;
+  }
+  // onset envelopes: remove the local mean, keep the positive part, normalise by the 90th percentile
+  const w = Math.max(3, Math.round(fr * 0.5));
+  const prep = a => {
+    const cs = new Float64Array(N + 1);
+    for (let i = 0; i < N; i++) cs[i + 1] = cs[i] + a[i];
+    for (let i = 0; i < N; i++) { const lo = Math.max(0, i - w), hi = Math.min(N, i + w + 1); a[i] = Math.max(0, a[i] - (cs[hi] - cs[lo]) / (hi - lo)); }
+    const p = Array.from(a).sort((x, y) => x - y)[Math.floor(N * 0.9)] || 0;
+    return p;
+  };
+  const pL = prep(oL), pH = prep(oH);
+  // kicks (bass) decide where the beat is; off-beat hats must not win. Fall back to highs if the bass is silent.
+  const wl = pL > 1e-6 ? 0.75 : 0, wh = 1 - wl;
+  for (let i = 0; i < N; i++) o[i] = wl * (oL[i] / (pL || 1)) + wh * (oH[i] / (pH || 1));
+  // tempo: autocorrelation with a mild prior around 120 BPM, octave-supported
+  const lagMin = Math.floor(fr * 60 / 190), lagMax = Math.ceil(fr * 60 / 65);
+  const acf = new Float64Array(lagMax * 4 + 2);
+  for (let L = lagMin; L < acf.length; L++) {
+    let s = 0; for (let i = 0; i + L < N; i++) s += o[i] * o[i + L];
+    acf[L] = s / Math.max(1, N - L);
+  }
+  let best = -1, bestL = lagMin;
+  for (let L = lagMin; L <= lagMax; L++) {
+    const bpm = 60 * fr / L, prior = Math.exp(-0.5 * Math.pow(Math.log2(bpm / 120) / 0.8, 2));
+    const sc = (acf[L] + 0.5 * acf[2 * L] + 0.25 * acf[Math.min(4 * L, acf.length - 1)]) * prior;
+    if (sc > best) { best = sc; bestL = L; }
+  }
+  const a0 = acf[bestL - 1], a1 = acf[bestL], a2 = acf[bestL + 1], den = a0 - 2 * a1 + a2;
+  const P0 = bestL + (den !== 0 ? 0.5 * (a0 - a2) / den : 0);
+  // fine search over tempo (+-1.2 %) and phase: the grid that puts the most onset energy on the beats.
+  // A 0.4 % tempo error would drift the grid by ~1 s over a 4 minute track, so this matters.
+  const interp = t => { const i = Math.floor(t), f = t - i; return (o[i] || 0) * (1 - f) + (o[i + 1] || 0) * f; };
+  let P = P0, bestPh = 0, bestS = -1;
+  for (let rel = -0.012; rel <= 0.0121; rel += 0.0004) {
+    const Pc = P0 * (1 + rel);
+    for (let ph = 0; ph < Pc; ph += 0.25) {
+      let s = 0, n = 0;
+      for (let t = ph; t < N - 2; t += Pc) { s += interp(t); n++; }
+      s /= Math.max(1, n);
+      if (s > bestS) { bestS = s; P = Pc; bestPh = ph; }
+    }
+  }
+  const bpm = 60 * fr / P;
+  const sorted = Array.from(o).sort((a, b) => a - b), p90 = sorted[Math.floor(N * 0.9)] || 1;
+  const beats = [], strengths = [];
+  for (let t = bestPh; t < N - 1; t += P) {
+    const i = Math.round(t);
+    beats.push(+((t * HOP) / sr).toFixed(3));
+    strengths.push(+Math.min(1, 0.35 + 0.65 * Math.max(o[i], o[i - 1] || 0, o[i + 1] || 0) / p90).toFixed(2));
+  }
+  // loudness curve (2 points per second) and sections by bar loudness
+  const perSec = 2, ne = Math.floor(dur * perSec), energy = new Array(ne).fill(0);
+  for (let i = 0; i < ne; i++) {
+    const a = Math.floor(i / perSec * fr), b = Math.min(N, Math.floor((i + 1) / perSec * fr) + 1); let s = 0;
+    for (let n = a; n < b; n++) s += rms[n]; energy[i] = s / Math.max(1, b - a);
+  }
+  const e95 = Array.from(energy).sort((a, b) => a - b)[Math.floor(ne * 0.95)] || 1;
+  const eNorm = energy.map(v => +Math.min(1, v / e95).toFixed(3));
+  // bars of 4 beats, anchored to the beat grid (first beat = bar 0), so section edges land on beats
+  const barDur = 4 * 60 / bpm, anchor = beats[0] || 0, bars = Math.max(1, Math.floor((dur - anchor) / barDur));
+  const barE = [];
+  for (let b = 0; b < bars; b++) {
+    const a = Math.floor((anchor + b * barDur) * perSec), c = Math.max(a + 1, Math.floor((anchor + (b + 1) * barDur) * perSec));
+    barE.push(eNorm.slice(a, c).reduce((s, v) => s + v, 0) / Math.max(1, c - a));
+  }
+  const med3 = barE.map((_, i) => { const v = [barE[i - 1] ?? barE[i], barE[i], barE[i + 1] ?? barE[i]].sort((p, q) => p - q); return v[1]; });
+  const lo = Math.min(...med3), hi = Math.max(...med3), range = hi - lo;
+  // levels relative to the track's own loud/quiet range; a flat track stays one section
+  const level = med3.map(v => range < 0.15 ? 1 : (v - lo) / range >= 0.62 ? 2 : (v - lo) / range >= 0.3 ? 1 : 0);
+  const runs = [];
+  level.forEach((l, b) => { if (runs.length && runs[runs.length - 1].level === l) runs[runs.length - 1].bars++; else runs.push({level: l, bars: 1, b0: b}); });
+  const merged = [];
+  for (const r of runs) {                                   // absorb runs shorter than 4 bars
+    if (merged.length && r.bars < 4) merged[merged.length - 1].bars += r.bars; else merged.push({...r});
+  }
+  const sections = merged.map((r, i) => ({t0: i === 0 ? 0 : +(anchor + r.b0 * barDur).toFixed(2), bars: r.bars, level: r.level}));
+  return {bpm: +bpm.toFixed(2), beats, strengths, energy: eNorm, sections, duration: +dur.toFixed(2), barDur};
+}
+
+function choreograph(A) {
+  const cues = []; let mid = 0;
+  const push = (t, effect, area = 'default') => cues.push({t: +t.toFixed(2), effect, area, ambient: undefined});
+  A.sections.forEach((s, i) => {
+    const t0 = i === 0 ? 0 : s.t0;
+    if (s.level === 0) push(t0, 'wave', 'auto');
+    else if (s.level === 1) { push(t0, mid++ % 2 ? 'beat step' : 'beat chase', mid % 2 ? 'default' : 'auto'); }
+    else {
+      const seq = ['beat flash', 'beat pulse', 'beat flash', 'beat chase'];
+      for (let b = 0, k = 0; b < s.bars; b += 8, k++) push(t0 + b * A.barDur, seq[k % seq.length], seq[k % seq.length] === 'beat chase' ? 'auto' : 'default');
+    }
+  });
+  return cues.map(c => ({...c, ambient: c.effect === 'wave' || c.effect === 'beat chase'}));
+}
+
+// ---- timeline: state, UI, playback sync ----------------------------------------
+let TLS = {name: '', audio: {name: '', duration: 0}, bpm: 0, beats: [], strengths: [], energy: [], cues: [], sections: []};
+const aud = $('aud'); let lights = false, syncTimer = null, tlDirty = false;
+const mmss = t => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, '0')}`;
+const tnote = t => { $('anote').textContent = t; };
+
+$('afile').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  aud.src = URL.createObjectURL(f);
+  if (TLS.audio.name === f.name && TLS.beats.length) { tnote('Using the saved analysis for ' + f.name); drawTl(); return; }
+  tnote('Analysing ' + f.name + ' ...');
+  try {
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const buf = await ac.decodeAudioData(await f.arrayBuffer());
+    const mono = new Float32Array(buf.length);
+    for (let c = 0; c < buf.numberOfChannels; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) mono[i] += d[i] / buf.numberOfChannels; }
+    await new Promise(r => setTimeout(r, 30));              // let the note paint
+    const A = analyzeSamples(mono, buf.sampleRate); ac.close();
+    TLS = {name: f.name.replace(/\.[^.]+$/, ''), audio: {name: f.name, duration: A.duration}, bpm: A.bpm,
+           beats: A.beats, strengths: A.strengths, energy: A.energy, sections: A.sections, barDur: A.barDur, cues: []};
+    TLS.cues = choreograph(A); $('sname').value = TLS.name; tlDirty = true;
+    tnote(`${f.name}: ${A.bpm} BPM, ${A.beats.length} beats, ${A.sections.length} sections. Cues were suggested, edit them below.`);
+    drawCues(); drawTl();
+  } catch (err) { tnote('Could not analyse this file: ' + err.message); }
+};
+
+function drawTl() {
+  const cv = $('tcv'), dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  if (!W) return;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const g = cv.getContext('2d'); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
+  const dur = TLS.audio.duration || aud.duration || 0;
+  if (!dur) { $('tinfo').textContent = 'no track'; return; }
+  const css = getComputedStyle(document.documentElement), accent = css.getPropertyValue('--accent').trim() || '#6d3df0',
+        fg = css.getPropertyValue('--fg').trim() || '#000', X = t => t / dur * W;
+  g.fillStyle = accent + '55'; g.beginPath(); g.moveTo(0, H);
+  TLS.energy.forEach((v, i) => g.lineTo(X(i / 2), H - 4 - v * (H - 22)));
+  g.lineTo(W, H); g.fill();
+  g.strokeStyle = fg + '33'; g.lineWidth = 1;
+  for (const s of TLS.sections || []) { g.beginPath(); g.moveTo(X(s.t0), 0); g.lineTo(X(s.t0), H); g.stroke(); }
+  g.font = '11px system-ui'; g.fillStyle = fg; g.strokeStyle = accent; g.lineWidth = 2;
+  TLS.cues.forEach(c => { g.beginPath(); g.moveTo(X(c.t), 0); g.lineTo(X(c.t), H); g.stroke(); g.fillText(c.effect.replace('beat ', 'b.'), X(c.t) + 3, 12); });
+  g.strokeStyle = fg; g.lineWidth = 2; g.beginPath(); g.moveTo(X(aud.currentTime), 0); g.lineTo(X(aud.currentTime), H); g.stroke();
+  $('tinfo').textContent = `${mmss(aud.currentTime || 0)} / ${mmss(dur)}  |  ${TLS.bpm || '-'} BPM  |  ${TLS.cues.length} cues`;
+}
+$('tcv').onclick = e => { const d = TLS.audio.duration || aud.duration; if (d) { aud.currentTime = e.offsetX / e.currentTarget.clientWidth * d; drawTl(); } };
+aud.addEventListener('timeupdate', drawTl);
+window.addEventListener('resize', drawTl);
+
+function drawCues() {
+  const box = $('cuelist'); box.innerHTML = '';
+  if (!TLS.cues.length) box.innerHTML = '<span class="muted">No cues. Analyse a track or add one.</span>';
+  const effects = status ? Object.keys(status.effects) : [], areas = status ? ['default', ...status.areas] : ['default', 'auto'];
+  TLS.cues.forEach((c, i) => {
+    const row = document.createElement('div'); row.className = 'row'; row.style.marginBottom = '6px';
+    const t = document.createElement('input'); t.type = 'number'; t.step = '0.1'; t.min = '0'; t.value = c.t; t.style.width = '84px';
+    t.onchange = () => { c.t = Math.max(0, +t.value); TLS.cues.sort((a, b) => a.t - b.t); cuesChanged(); drawCues(); };
+    const ef = document.createElement('select'); effects.forEach(n => ef.add(new Option(n, n))); ef.value = c.effect;
+    ef.onchange = () => { c.effect = ef.value; cuesChanged(); };
+    const ar = document.createElement('select'); areas.forEach(n => ar.add(new Option(n, n))); ar.value = areas.includes(c.area) ? c.area : 'auto';
+    ar.onchange = () => { c.area = ar.value; cuesChanged(); };
+    const am = document.createElement('label'); am.className = 'muted'; const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!c.ambient;
+    cb.onchange = () => { c.ambient = cb.checked; cuesChanged(); }; am.append(cb, ' ambient');
+    const go = document.createElement('button'); go.textContent = 'Go'; go.onclick = () => { aud.currentTime = c.t; };
+    const del = document.createElement('button'); del.textContent = 'x'; del.onclick = () => { TLS.cues.splice(i, 1); cuesChanged(); drawCues(); };
+    row.append(t, ef, ar, am, go, del); box.appendChild(row);
+  });
+}
+function cuesChanged() { tlDirty = true; drawTl(); if (!aud.paused) pushShow(true); }
+$('c-auto').onclick = () => {
+  if (!TLS.beats.length) { tnote('Analyse a track first.'); return; }
+  TLS.cues = choreograph({sections: TLS.sections, barDur: TLS.barDur || 4 * 60 / TLS.bpm}); cuesChanged(); drawCues();
+};
+$('c-add').onclick = () => { TLS.cues.push({t: +(aud.currentTime || 0).toFixed(1), effect: 'beat pulse', area: 'default', ambient: false});
+  TLS.cues.sort((a, b) => a.t - b.t); cuesChanged(); drawCues(); };
+
+const offMs = () => +$('toff').value;
+try { $('toff').value = localStorage.getItem('toff') || 0; } catch (e) {}
+$('toffv').textContent = $('toff').value;
+$('toff').oninput = () => { $('toffv').textContent = $('toff').value; try { localStorage.setItem('toff', $('toff').value); } catch (e) {} };
+$('toff').onchange = () => { if (!aud.paused) api('/api/timeline/seek', {position: aud.currentTime, offset_ms: offMs()}); };
+
+async function pushShow(resume) {
+  const r = await api('/api/timeline/load', {show: TLS});
+  if (r.error) { tnote('Show rejected: ' + r.error); return false; }
+  if (resume) await api('/api/timeline/play', {position: aud.currentTime, offset_ms: offMs()});
+  return true;
+}
+async function startLights() {
+  if (status && status.running) return true;
+  await api('/api/start', {});
+  for (let i = 0; i < 50; i++) { await new Promise(r => setTimeout(r, 300)); const s = await api('/api/status'); render(s); if (s.info.error) { tnote('Lights failed: ' + s.info.error); return false; } if (s.running && s.info.fps > 0) return true; }
+  tnote('Lights did not start in time.'); return false;
+}
+let starting = false;
+async function beginSync() {
+  if (await pushShow(true)) {
+    clearInterval(syncTimer);
+    syncTimer = setInterval(() => api('/api/timeline/sync', {position: aud.currentTime, offset_ms: offMs()}), 2000);
+  }
+}
+aud.addEventListener('play', async () => {
+  if (starting || !TLS.beats.length) return;               // no analysis: plain audio, nothing to sync
+  if (!status || !status.running) {                        // start the lights first, then the audio
+    starting = true; aud.pause();
+    const ok = await startLights();
+    if (ok) { try { await aud.play(); } catch (e) { tnote('Could not start audio: ' + e.message); } }
+    starting = false;
+    if (ok && !aud.paused) beginSync();
+    return;
+  }
+  beginSync();
+});
+aud.addEventListener('pause', () => { clearInterval(syncTimer); if (TLS.beats.length) api('/api/timeline/pause', {}); });
+aud.addEventListener('seeked', () => { if (TLS.beats.length && !aud.paused) api('/api/timeline/seek', {position: aud.currentTime, offset_ms: offMs()}); });
+
+async function refreshShows() {
+  const r = await api('/api/timeline/list'); const s = $('slist'); s.innerHTML = '';
+  (r.shows || []).forEach(n => s.add(new Option(n, n)));
+}
+$('s-save').onclick = async () => {
+  TLS.name = $('sname').value.trim() || TLS.name || 'show';
+  const r = await api('/api/timeline/save', {show: TLS});
+  $('snote').textContent = r.error ? 'Error: ' + r.error : 'Saved as ' + r.name + '.'; if (!r.error) { tlDirty = false; refreshShows(); }
+};
+$('s-load').onclick = async () => {
+  const n = $('slist').value; if (!n) return;
+  const r = await api('/api/timeline/get?name=' + encodeURIComponent(n));
+  if (r.error) { $('snote').textContent = r.error; return; }
+  TLS = {...r.show, sections: [], barDur: r.show.bpm ? 4 * 60 / r.show.bpm : 2}; $('sname').value = TLS.name;
+  $('snote').textContent = `Loaded '${TLS.name}'. Choose the audio file '${TLS.audio.name}' to play it.`;
+  drawCues(); drawTl();
+};
+$('s-del').onclick = async () => {
+  const n = $('slist').value; if (!n || !confirm(`Delete show '${n}'?`)) return;
+  await api('/api/timeline/delete', {name: n}); refreshShows();
+};
 
 async function poll() { try { render(await api('/api/status')); } catch (e) {} setTimeout(poll, 700); }
 poll();

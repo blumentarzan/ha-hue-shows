@@ -13,6 +13,16 @@ API (DTLS, 50 Hz).
 For beat sync, click **Use microphone** (Home Assistant is served over https, so
 the browser allows microphone access) or pick a simulated BPM.
 
+## Timeline mode (choreographed shows)
+
+Open the **Timeline** tab, choose an audio file, and let it analyse (in your
+browser; nothing is uploaded). It finds the tempo and beats, splits the track
+into quiet and loud parts, and suggests cues you can edit. Press play on the
+page: the lights start automatically and follow the audio. If the lights run
+ahead of or behind the speakers, move the **Lights offset** slider. Saved shows
+keep the analysis and cues but not the audio file: choose the file again after
+loading a show.
+
 ## Options
 
 - **bridge**: optional. Pre-fills the bridge IP on the setup card.

@@ -133,9 +133,152 @@ def default_area(effect):
     return "auto"
 
 
+# ---- timeline (pre-analysed track, choreographed cues) -----------------------
+import bisect, re
+
+SHOW_DIR = os.environ.get("HUE_SHOW_DIR") or os.path.join(os.path.dirname(hs.CFG) or ".", "hue_shows_saved")
+
+
+def validate_show(d):
+    """Clean a show: {name, audio:{name,duration}, bpm, beats[], strengths[], energy[], cues[]}."""
+    if not isinstance(d, dict):
+        raise ValueError("show must be an object")
+    pn = set(preset_names())
+    def fl(v, what, lo=0.0, hi=36000.0):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{what} must be a number")
+        if not lo <= v <= hi:
+            raise ValueError(f"{what} out of range")
+        return round(v, 3)
+    beats = [fl(b, "beat") for b in (d.get("beats") or [])][:30000]
+    beats = sorted(beats)
+    st_ = [max(0.0, min(1.0, float(x))) for x in (d.get("strengths") or [])][:len(beats)]
+    st_ += [1.0] * (len(beats) - len(st_))
+    cues = []
+    for c in d.get("cues") or []:
+        eff = c.get("effect")
+        if eff not in CATALOG:
+            raise ValueError(f"unknown effect '{eff}'")
+        area = c.get("area", "default")
+        if area not in ("auto", "default") and area not in pn:
+            area = "auto"
+        cues.append({"t": fl(c.get("t", 0), "cue time"), "effect": eff, "area": area,
+                     "ambient": bool(c.get("ambient", CATALOG[eff][2]))})
+    cues.sort(key=lambda c: c["t"])
+    au = d.get("audio") or {}
+    return {"name": re.sub(r"[^A-Za-z0-9 _.-]", "", str(d.get("name", "show")))[:60].strip() or "show",
+            "audio": {"name": str(au.get("name", ""))[:120], "duration": fl(au.get("duration", 0), "duration")},
+            "bpm": fl(d.get("bpm", 0), "bpm", 0, 400), "beats": beats, "strengths": [round(x, 3) for x in st_],
+            "energy": [round(max(0.0, min(1.0, float(x))), 3) for x in (d.get("energy") or [])][:2000],
+            "cues": cues}
+
+
+class Timeline:
+    """Runs a show's cues and beat grid against a playback position that the
+    browser reports (audio element). The server keeps its own clock between
+    syncs; /api/timeline/sync corrects drift. offset (s) shifts the lights
+    ahead (+) or behind (-) the audio to compensate speaker latency."""
+
+    def __init__(self):
+        self.show = None
+        self.playing = False
+        self.start_wall = 0.0
+        self.paused_at = 0.0
+        self.offset = 0.0
+        self.bi = 0
+        self.ci = -1
+        self.last_pos = 0.0
+
+    def load(self, show):
+        self.show, self.playing, self.paused_at = show, False, 0.0
+        self._reseek(0.0)
+
+    def raw_position(self):
+        return time.time() - self.start_wall if self.playing else self.paused_at
+
+    def _reseek(self, p):
+        if not self.show:
+            return
+        p += self.offset
+        self.bi = bisect.bisect_right(self.show["beats"], p)
+        times = [c["t"] for c in self.show["cues"]]
+        self.ci = bisect.bisect_right(times, p) - 1
+        self.last_pos = p
+        self.force_cue = True
+
+    def play(self, pos, offset=None):
+        if offset is not None:
+            self.offset = offset
+        self.start_wall, self.playing = time.time() - pos, True
+        self._reseek(pos)
+
+    def pause(self):
+        self.paused_at, self.playing = self.raw_position(), False
+
+    def seek(self, pos, offset=None):
+        if offset is not None:
+            self.offset = offset
+        if self.playing:
+            self.start_wall = time.time() - pos
+        else:
+            self.paused_at = pos
+        self._reseek(pos)
+
+    def sync(self, pos, offset=None):
+        if offset is not None:
+            self.offset = offset
+        if self.playing and abs(pos - self.raw_position()) > 0.04:
+            self.start_wall = time.time() - pos
+
+    def tick(self, live):
+        sh = self.show
+        if not sh or not self.playing:
+            return
+        p = self.raw_position() + self.offset
+        if p < self.last_pos - 0.1:                       # jumped back
+            self._reseek(p - self.offset)
+        self.last_pos = p
+        dur = sh["audio"]["duration"]
+        if dur and p > dur + 2.0:
+            self.playing = False
+            return
+        cues = sh["cues"]
+        ni = self.ci
+        while ni + 1 < len(cues) and cues[ni + 1]["t"] <= p:
+            ni += 1
+        if ni != self.ci or getattr(self, "force_cue", False):
+            self.ci, self.force_cue = ni, False
+            if ni >= 0:
+                c = cues[ni]
+                live.state.update(effect=c["effect"], ambient=c["ambient"],
+                                  area=default_area(c["effect"]) if c["area"] == "default" else c["area"])
+        beats, fired = sh["beats"], None
+        while self.bi < len(beats) and beats[self.bi] <= p:
+            fired = self.bi
+            self.bi += 1
+        if fired is not None and p - beats[fired] < 0.25:     # skip stale beats after a stall
+            live.bc.sim_bpm = 0.0
+            live.bc.beat(sh["strengths"][fired])
+
+    def status(self):
+        sh = self.show
+        return {"loaded": bool(sh), "name": sh["name"] if sh else "", "playing": self.playing,
+                "position": round(self.raw_position(), 2), "cue": self.ci, "offset_ms": round(self.offset * 1000)}
+
+
+def show_path(name):
+    safe = re.sub(r"[^A-Za-z0-9 _.-]", "", name).strip()
+    if not safe:
+        raise ValueError("bad show name")
+    return os.path.join(SHOW_DIR, safe + ".json")
+
+
 # ---- live runner ------------------------------------------------------------
 class Live:
     def __init__(self):
+        self.tl = Timeline()
         self.bc = BeatClock()
         self.engine = None
         self.thread = None
@@ -172,6 +315,7 @@ class Live:
             while self.running:
                 now = time.time() - t0
                 self.bc.tick()
+                self.tl.tick(self)
                 s = self.state
                 effect = self.effect()
                 e.ambient_on = s["ambient"]
@@ -212,7 +356,7 @@ class Live:
 
     def status(self):
         return {"running": self.running, "state": self.state, "info": self.info,
-                "configured": hs.is_configured(), "default_bridge": os.environ.get("HUE_BRIDGE", ""),
+                "timeline": self.tl.status(), "configured": hs.is_configured(), "default_bridge": os.environ.get("HUE_BRIDGE", ""),
                 "bpm": self.bc.bpm, "beats": self.bc.count, "active": self.bc.active, "sim_bpm": self.bc.sim_bpm,
                 "effects": {k: v[1] for k, v in CATALOG.items()},
                 "areas": ["auto"] + preset_names()}
@@ -234,7 +378,52 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _timeline_post(self, body):
+        tl, p = LIVE.tl, self.path.rsplit("/", 1)[-1]
+        off = body.get("offset_ms")
+        off = None if off is None else max(-1.0, min(1.0, float(off) / 1000.0))
+        try:
+            if p == "load":
+                tl.load(validate_show(body.get("show", body)))
+            elif p == "save":
+                show = validate_show(body.get("show", body))
+                os.makedirs(SHOW_DIR, exist_ok=True)
+                with open(show_path(show["name"]), "w") as f:
+                    json.dump(show, f)
+                return self._json({"ok": True, "name": show["name"]})
+            elif p == "delete":
+                os.remove(show_path(str(body.get("name", ""))))
+                return self._json({"ok": True})
+            elif not tl.show:
+                return self._json({"error": "no show loaded"}, 400)
+            elif p == "play":
+                tl.play(max(0.0, float(body.get("position", 0))), off)
+            elif p == "pause":
+                tl.pause()
+            elif p == "seek":
+                tl.seek(max(0.0, float(body.get("position", 0))), off)
+            elif p == "sync":
+                tl.sync(max(0.0, float(body.get("position", 0))), off)
+            else:
+                return self._json({"error": "unknown timeline call"}, 404)
+        except (ValueError, TypeError) as ex:
+            return self._json({"error": str(ex)}, 400)
+        except OSError as ex:
+            return self._json({"error": f"file error: {ex}"}, 500)
+        return self._json({"ok": True, "timeline": tl.status()})
+
     def do_GET(self):
+        path, _, query = self.path.partition("?")
+        if path == "/api/timeline/list":
+            names = sorted(f[:-5] for f in os.listdir(SHOW_DIR) if f.endswith(".json")) if os.path.isdir(SHOW_DIR) else []
+            return self._json({"shows": names})
+        if path == "/api/timeline/get":
+            from urllib.parse import parse_qs
+            try:
+                with open(show_path(parse_qs(query).get("name", [""])[0])) as f:
+                    return self._json({"show": validate_show(json.load(f))})
+            except (OSError, ValueError):
+                return self._json({"error": "show not found"}, 404)
         if self.path == "/api/status":
             return self._json(LIVE.status())
         if self.path == "/api/layout":
@@ -290,6 +479,8 @@ class H(BaseHTTPRequestHandler):
             return self._json({"ok": True})
         if self.path in ("/api/layout", "/api/layout/suggest", "/api/layout/apply"):
             return self._layout_post(body)
+        if self.path.startswith("/api/timeline/"):
+            return self._timeline_post(body)
         if self.path == "/api/set":
             s = LIVE.state
             if body.get("effect") in CATALOG:
